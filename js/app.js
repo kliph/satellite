@@ -1,7 +1,6 @@
 // Main application logic
 
 import * as crypto from './crypto.js';
-import * as auth from './auth.js';
 import * as github from './github.js';
 import * as feed from './feed.js';
 
@@ -22,7 +21,7 @@ function getState() {
   return {
     domain: getDomain(),
     repo: localStorage.getItem('satproto_github_repo'),
-    token: auth.getStoredToken(),
+    token: localStorage.getItem('satproto_github_token'),
   };
 }
 
@@ -56,6 +55,58 @@ function escHtml(s) {
 
 function escAttr(s) {
   return (s || '').replace(/'/g, "\\'").replace(/"/g, '&quot;');
+}
+
+// --- Pending post cache (optimistic UI) ---
+
+const PENDING_KEY = 'satproto_pending_posts';
+const PENDING_FOLLOWS_KEY = 'satproto_pending_follows';
+
+function savePendingFollow(target) {
+  const pending = getPendingFollows();
+  if (!pending.includes(target)) pending.push(target);
+  localStorage.setItem(PENDING_FOLLOWS_KEY, JSON.stringify(pending));
+}
+
+function getPendingFollows() {
+  try {
+    return JSON.parse(localStorage.getItem(PENDING_FOLLOWS_KEY) || '[]');
+  } catch {
+    return [];
+  }
+}
+
+function clearSyncedFollows(remoteFollows) {
+  const remoteSet = new Set(remoteFollows);
+  const remaining = getPendingFollows().filter((f) => !remoteSet.has(f));
+  localStorage.setItem(PENDING_FOLLOWS_KEY, JSON.stringify(remaining));
+  return remaining;
+}
+
+function removePendingFollow(target) {
+  const remaining = getPendingFollows().filter((f) => f !== target);
+  localStorage.setItem(PENDING_FOLLOWS_KEY, JSON.stringify(remaining));
+}
+
+function savePendingPost(post) {
+  const pending = getPendingPosts();
+  pending.push({ ...post, _pending: true });
+  localStorage.setItem(PENDING_KEY, JSON.stringify(pending));
+}
+
+function getPendingPosts() {
+  try {
+    return JSON.parse(localStorage.getItem(PENDING_KEY) || '[]');
+  } catch {
+    return [];
+  }
+}
+
+function clearSyncedPosts(remoteIds) {
+  const pending = getPendingPosts();
+  const remaining = pending.filter((p) => !remoteIds.has(p.id));
+  localStorage.setItem(PENDING_KEY, JSON.stringify(remaining));
+  return remaining;
 }
 
 // --- UI ---
@@ -111,15 +162,20 @@ async function refreshFollows() {
   const { domain } = getState();
   try {
     const list = await feed.fetchFollowList(domain);
+    const pendingFollows = clearSyncedFollows(list.follows);
     const el = document.getElementById('follows-list');
-    if (list.follows.length === 0) {
+    const allFollows = [
+      ...list.follows.map((f) => ({ domain: f, pending: false })),
+      ...pendingFollows.map((f) => ({ domain: f, pending: true })),
+    ];
+    if (allFollows.length === 0) {
       el.innerHTML = '<span class="follows-empty">Not following anyone yet</span>';
       return;
     }
-    el.innerHTML = list.follows
+    el.innerHTML = allFollows
       .map(
-        (f) =>
-          `<span class="follow-chip">${escHtml(f)} <button onclick="doUnfollow('${escAttr(f)}')" class="unfollow-btn">x</button></span>`
+        ({ domain: f, pending }) =>
+          `<span class="follow-chip${pending ? ' follow-pending' : ''}">${escHtml(f)}${pending ? ' <span class="post-pending-label">syncing…</span>' : ''} <button onclick="doUnfollow('${escAttr(f)}')" class="unfollow-btn">x</button></span>`
       )
       .join('');
   } catch (e) {
@@ -135,7 +191,8 @@ async function refreshFeed() {
     const sk = getSecretKey();
     const postArrays = [];
 
-    for (const followed of followList.follows) {
+    const allFollowed = [...new Set([...followList.follows, ...getPendingFollows()])];
+    for (const followed of allFollowed) {
       try {
         const posts = await feed.fetchUserPosts(
           followed,
@@ -147,6 +204,21 @@ async function refreshFeed() {
       } catch (e) {
         console.warn(`Failed to fetch from ${followed}:`, e);
       }
+    }
+
+    // Clear synced pending posts and merge remaining ones
+    const remoteIds = new Set(postArrays.flat().map((p) => p.id));
+
+    // Also check own remote post index so pending posts authored by self get cleared
+    try {
+      const ownIndex = await feed.fetchPostIndex(domain);
+      for (const id of ownIndex.posts) remoteIds.add(id);
+    } catch {
+      // not yet published, ignore
+    }
+    const pendingPosts = clearSyncedPosts(remoteIds);
+    if (pendingPosts.length > 0) {
+      postArrays.push(pendingPosts);
     }
 
     const merged = feed.mergeFeed(postArrays);
@@ -205,8 +277,13 @@ function renderFeed(posts) {
     const div = document.createElement('div');
     div.className = 'post';
 
+    if (post._pending) div.classList.add('post-pending');
+
     let html = '';
     html += `<span class="post-author">${escHtml(post.author)}</span>`;
+    if (post._pending) {
+      html += `<span class="post-pending-label">syncing…</span>`;
+    }
     html += `<span class="post-time">${new Date(post.created_at).toLocaleString()}</span>`;
     html += `<div class="post-text">${escHtml(post.text)}</div>`;
     html += `<div class="post-actions">`;
@@ -215,8 +292,11 @@ function renderFeed(posts) {
 
     if (post._replies && post._replies.length > 0) {
       for (const reply of post._replies) {
-        html += `<div class="reply">`;
+        html += `<div class="reply${reply._pending ? ' post-pending' : ''}">`;
         html += `<span class="post-author">${escHtml(reply.author)}</span>`;
+        if (reply._pending) {
+          html += `<span class="post-pending-label">syncing…</span>`;
+        }
         html += `<span class="post-time">${new Date(reply.created_at).toLocaleString()}</span>`;
         html += `<div class="post-text">${escHtml(reply.text)}</div>`;
         html += `</div>`;
@@ -231,15 +311,15 @@ function renderFeed(posts) {
 // --- Global handlers (called from HTML) ---
 
 window.saveSetup = async function () {
-  const username = document.getElementById('username-input').value.trim();
   const token = document.getElementById('token-input').value.trim();
-  if (!username || !token) return alert('Username and token are required');
+  if (!token) return alert('Token is required');
 
   setStatus('Initializing your site...');
   try {
+    const username = await github.getAuthenticatedUser(token);
     const repo = `${username}/${getRepoName()}`;
     localStorage.setItem('satproto_github_repo', repo);
-    auth.storeToken(token);
+    localStorage.setItem('satproto_github_token', token);
 
     await bootstrap();
     showMain();
@@ -267,16 +347,13 @@ window.signIn = async function () {
     const publicKey = crypto.derivePublicKey(secretKey);
 
     // Fetch and decrypt self data from the site
-    const base = await feed.getSatBase(domain);
-    const resp = await fetch(`${base}/keys/_self.json`);
-    if (!resp.ok) throw new Error('Could not fetch self data — has this site been initialized?');
-    const envelope = await resp.json();
+    const envelope = await feed.fetchSelfData(domain);
     const sealed = crypto.fromBase64(envelope.sealed_data);
     const decrypted = crypto.openSealedBox(sealed, secretKey);
     const selfData = JSON.parse(new TextDecoder().decode(decrypted));
 
     localStorage.setItem('satproto_github_repo', selfData.repo);
-    auth.storeToken(selfData.token);
+    localStorage.setItem('satproto_github_token', selfData.token);
     localStorage.setItem('satproto_secret_key', sk);
     localStorage.setItem('satproto_public_key', crypto.toBase64(publicKey));
     localStorage.setItem('satproto_content_key', selfData.content_key);
@@ -304,12 +381,14 @@ window.exportKeys = function () {
 window.reinitialize = async function () {
   if (
     !confirm(
-      'Re-initialize your site? This will reset your profile and post index.'
+      'Re-initialize your site? This will permanently delete all posts, follows, and reset your profile.'
     )
   )
     return;
   setStatus('Re-initializing...');
   try {
+    localStorage.removeItem(PENDING_KEY);
+    localStorage.removeItem(PENDING_FOLLOWS_KEY);
     await bootstrap();
     setStatus('Site re-initialized!');
     await refreshFeed();
@@ -318,8 +397,24 @@ window.reinitialize = async function () {
   }
 };
 
+async function publishPost(post) {
+  const { token, repo } = getState();
+  const contentKey = getContentKey();
+  const encrypted = crypto.encryptData(
+    new TextEncoder().encode(JSON.stringify(post)), contentKey
+  );
+  const index = await feed.fetchPostIndexOrEmpty(getDomain());
+  index.posts.unshift(post.id);
+  await github.pushFiles(token, repo, [
+    github.binaryEntry(`posts/${post.id}.json.enc`, encrypted),
+    github.textEntry('posts/index.json', JSON.stringify(index)),
+  ], post.reply_to ? `reply: ${post.id}` : `new post: ${post.id}`);
+  savePendingPost(post);
+  await refreshFeed();
+}
+
 window.submitPost = async function () {
-  const { domain, token, repo } = getState();
+  const { domain } = getState();
   const text = document.getElementById('post-text').value.trim();
   if (!text) return;
 
@@ -328,40 +423,19 @@ window.submitPost = async function () {
   btn.textContent = 'Posting...';
 
   try {
-    const id = generatePostId();
-    const post = {
-      id,
+    await publishPost({
+      id: generatePostId(),
       author: domain,
       created_at: new Date().toISOString(),
       text,
-    };
-
-    const contentKey = getContentKey();
-    const postJson = new TextEncoder().encode(JSON.stringify(post));
-    const encrypted = crypto.encryptData(postJson, contentKey);
-
-    // Update post index
-    let index;
-    try {
-      index = await feed.fetchPostIndex(domain);
-    } catch {
-      index = { posts: [] };
-    }
-    index.posts.unshift(id);
-
-    await github.pushFiles(token, repo, [
-      github.binaryEntry(`posts/${id}.json.enc`, encrypted),
-      github.textEntry('posts/index.json', JSON.stringify(index)),
-    ], `new post: ${id}`);
-
+    });
     document.getElementById('post-text').value = '';
-    await refreshFeed();
   } catch (e) {
     alert('Failed to post: ' + e);
+  } finally {
+    btn.disabled = false;
+    btn.textContent = 'Post';
   }
-
-  btn.disabled = false;
-  btn.textContent = 'Post';
 };
 
 window.doFollow = async function () {
@@ -386,12 +460,7 @@ window.doFollow = async function () {
       encrypted_key: crypto.toBase64(sealed),
     };
     // Update follow list
-    let list;
-    try {
-      list = await feed.fetchFollowList(domain);
-    } catch {
-      list = { follows: [] };
-    }
+    const list = await feed.fetchFollowListOrEmpty(domain);
     if (!list.follows.includes(target)) {
       list.follows.push(target);
     }
@@ -402,20 +471,22 @@ window.doFollow = async function () {
     ], `follow ${target}`);
 
     document.getElementById('follow-domain-input').value = '';
+    savePendingFollow(target);
     await refreshFollows();
     await refreshFeed();
   } catch (e) {
     alert('Failed to follow: ' + e);
+  } finally {
+    btn.disabled = false;
+    btn.textContent = 'Follow';
   }
-
-  btn.disabled = false;
-  btn.textContent = 'Follow';
 };
 
 window.doUnfollow = async function (target) {
   if (!confirm(`Unfollow ${target}? This will re-encrypt all your posts.`))
     return;
 
+  removePendingFollow(target);
   const { domain, token, repo } = getState();
   setStatus(`Unfollowing ${target}...`);
 
@@ -423,12 +494,7 @@ window.doUnfollow = async function (target) {
     const oldContentKey = getContentKey();
 
     // Fetch post index
-    let index;
-    try {
-      index = await feed.fetchPostIndex(domain);
-    } catch {
-      index = { posts: [] };
-    }
+    const index = await feed.fetchPostIndexOrEmpty(domain);
 
     // Generate new content key
     const newContentKey = crypto.generateContentKey();
@@ -454,12 +520,7 @@ window.doUnfollow = async function (target) {
     }
 
     // Update follow list
-    let list;
-    try {
-      list = await feed.fetchFollowList(domain);
-    } catch {
-      list = { follows: [] };
-    }
+    const list = await feed.fetchFollowListOrEmpty(domain);
     list.follows = list.follows.filter((d) => d !== target);
 
     // Re-create key envelopes for remaining followers
@@ -493,36 +554,16 @@ window.doUnfollow = async function (target) {
 window.doReply = async function (postId, postAuthor) {
   const text = prompt('Reply:');
   if (!text) return;
-  const { domain, token, repo } = getState();
+  const { domain } = getState();
   try {
-    const id = generatePostId();
-    const post = {
-      id,
+    await publishPost({
+      id: generatePostId(),
       author: domain,
       created_at: new Date().toISOString(),
       text,
       reply_to: postId,
       reply_to_author: postAuthor,
-    };
-
-    const contentKey = getContentKey();
-    const postJson = new TextEncoder().encode(JSON.stringify(post));
-    const encrypted = crypto.encryptData(postJson, contentKey);
-
-    let index;
-    try {
-      index = await feed.fetchPostIndex(domain);
-    } catch {
-      index = { posts: [] };
-    }
-    index.posts.unshift(id);
-
-    await github.pushFiles(token, repo, [
-      github.binaryEntry(`posts/${id}.json.enc`, encrypted),
-      github.textEntry('posts/index.json', JSON.stringify(index)),
-    ], `reply: ${id}`);
-
-    await refreshFeed();
+    });
   } catch (e) {
     alert('Failed to reply: ' + e);
   }
@@ -532,22 +573,14 @@ window.doReply = async function (postId, postAuthor) {
 // --- Init ---
 
 function updateTokenLink() {
-  const username = document.getElementById('username-input').value.trim();
-  const hint = document.getElementById('token-hint');
-  if (!username) {
-    hint.style.display = 'none';
-    return;
-  }
   const repoName = getRepoName();
   const params = new URLSearchParams({
     name: 'sAT Proto',
     description: `Choose "Only select repositories"\nSelect "${repoName}"\nClick "Add permissions"\nChoose "Contents"\nSet "Access: Read and write"`,
-    target_name: username,
   });
   document.getElementById('token-link').href =
     `https://github.com/settings/personal-access-tokens/new?${params}`;
   document.getElementById('repo-hint').textContent = repoName;
-  hint.style.display = '';
 }
 
 async function start() {
@@ -565,8 +598,7 @@ async function start() {
   document.getElementById('public-key-display').textContent =
     `Public key: ${pk}`;
 
-  document.getElementById('username-input')
-    .addEventListener('input', updateTokenLink);
+  updateTokenLink();
 
   const { repo, token } = getState();
   if (repo && token) {
